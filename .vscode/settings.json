@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "xf86drmmode.h": "c",
+        "fcntl.h": "c",
+        "fcntl-linux.h": "c"
+    }
+}
