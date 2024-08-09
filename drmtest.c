@@ -13,11 +13,38 @@
 typedef struct {
     int fd;
     drmModeRes *res;
+    drmModeConnector *connector;
+    drmModeEncoder *encoder;
+    drmModeCrtc *crtc;
 } DrmDevice;
 
 
-DrmDevice open_drm_device(const char **device_paths, int num_paths) {
-    DrmDevice device = { .fd = -1, .res = NULL };
+void cleanup_drm_device(DrmDevice *device) {
+    if (device->crtc) {
+        drmModeFreeCrtc(device->crtc);
+        device->crtc = NULL;
+    }
+    if (device->connector) {
+        drmModeFreeConnector(device->connector);
+        device->connector = NULL;
+    }
+    if (device->encoder) {
+        drmModeFreeEncoder(device->encoder);
+        device->encoder = NULL;
+    }
+    if (device->res) {
+        drmModeFreeResources(device->res);
+        device->res = NULL;
+    }
+    if (device->fd >= 0) {
+        close(device->fd);
+        device->fd = -1;
+    }
+}
+
+
+DrmDevice init_drm_device(const char **device_paths, int num_paths) {
+    DrmDevice device = { .fd = -1, .res = NULL, .connector = NULL, .encoder = NULL, .crtc = NULL };
     for (int i = 0; i < num_paths; i++) {
         device.fd = open(device_paths[i], O_RDWR | O_CLOEXEC);
         if (device.fd < 0) {
@@ -67,6 +94,46 @@ drmModeEncoder* find_valid_encoder(int fd, drmModeRes *res, drmModeConnector *co
     return NULL;
 }
 
+DrmDevice open_drm_device(const char *device_paths[], int num_paths) {
+    DrmDevice device = {0};
+
+    device = init_drm_device(device_paths, num_paths);
+    if (device.fd < 0 || !device.res) {
+        fprintf(stderr, "Failed to find a valid DRM device\n");
+        return device;
+    }
+
+    device.connector = find_valid_connector(device.fd, device.res);
+    if (!device.connector) {
+        fprintf(stderr, "No connected monitor found\n");
+        cleanup_drm_device(&device);
+        return device;
+    }
+
+    int connector_id = device.connector->connector_id;
+    printf("Connected monitor found: connector ID %d\n", connector_id);
+
+    device.encoder = find_valid_encoder(device.fd, device.res, device.connector);
+    if (!device.encoder) {
+        fprintf(stderr, "Failed to find a valid encoder for the connector\n");
+        cleanup_drm_device(&device);
+        return device;
+    }
+
+    int crtc_id = device.encoder->crtc_id;
+    drmModeFreeEncoder(device.encoder);
+    device.encoder = NULL; // Clear the encoder as it is freed
+
+    device.crtc = drmModeGetCrtc(device.fd, crtc_id);
+    if (!device.crtc) {
+        fprintf(stderr, "Failed to get CRTC information\n");
+        cleanup_drm_device(&device);
+        return device;
+    }
+
+    return device;
+}
+
 
 void *create_framebuffer(int fd, int width, int height, int bpp, uint32_t *fb_id) {
     struct drm_mode_create_dumb create_req;
@@ -105,48 +172,12 @@ void *create_framebuffer(int fd, int width, int height, int bpp, uint32_t *fb_id
 }
 
 
-
 int main()
 {
     const char *device_paths[] = {"/dev/dri/card0", "/dev/dri/card1"};
     DrmDevice device = open_drm_device(device_paths, 2);
 
-    if (device.fd < 0 || !device.res) {
-        fprintf(stderr, "Failed to find a valid DRM device\n");
-        return 1;
-    }
-
-    drmModeConnector *connector = find_valid_connector(device.fd, device.res);
-    if (!connector) {
-        fprintf(stderr, "No connected monitor found\n");
-        drmModeFreeResources(device.res);
-        close(device.fd);
-        return 1;
-    }
-
-    int connector_id = connector->connector_id;
-    printf("Found %d connectors\n", device.res->count_connectors);
-    printf("Connected monitor found: connector ID %d\n", connector_id);
-
-    
-    drmModeEncoder *encoder = find_valid_encoder(device.fd, device.res, connector);
-    if (!encoder) {
-        fprintf(stderr, "Failed to find a valid encoder for the connector\n");
-        drmModeFreeConnector(connector);
-        drmModeFreeResources(device.res);
-        close(device.fd);
-        return 1;
-    }
-
-    int crtc_id = encoder->crtc_id;
-    drmModeFreeEncoder(encoder);
-
-    drmModeCrtc *crtc = drmModeGetCrtc(device.fd, crtc_id);
-    if (!crtc) {
-        fprintf(stderr, "Failed to get CRTC information\n");
-        drmModeFreeConnector(connector);
-        drmModeFreeResources(device.res);
-        close(device.fd);
+    if (device.fd < 0 || !device.res || !device.connector || !device.crtc) {
         return 1;
     }
 
@@ -160,13 +191,11 @@ int main()
         framebuffers[i] = create_framebuffer(device.fd, width, height, bpp, &fb_ids[i]);
         if (!framebuffers[i]) {
             fprintf(stderr, "Failed to create framebuffer %d\n", i);
+            cleanup_drm_device(&device);
             return 1;
         }
     }
 
-    drmModeFreeCrtc(crtc);
-    drmModeFreeConnector(connector);
-    drmModeFreeResources(device.res);
-    close(device.fd);
+    cleanup_drm_device(&device);
     return 0;
 }
